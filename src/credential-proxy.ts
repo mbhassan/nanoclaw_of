@@ -15,7 +15,9 @@ import { request as httpsRequest } from 'https';
 import { request as httpRequest, RequestOptions } from 'http';
 
 import { readEnvFile } from './env.js';
+import { finishProxyLlmRun, startProxyLlmRun } from './langsmith.js';
 import { logger } from './logger.js';
+import { setSpanError, startSpan } from './telemetry.js';
 
 export type AuthMode = 'api-key' | 'oauth';
 
@@ -46,10 +48,15 @@ export function startCredentialProxy(
 
   return new Promise((resolve, reject) => {
     const server = createServer((req, res) => {
+      const span = startSpan('nanoclaw.credential_proxy.request', {
+        'http.request.method': req.method || 'GET',
+        'url.path': req.url || '/',
+      });
       const chunks: Buffer[] = [];
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
         const body = Buffer.concat(chunks);
+        const pathname = req.url || '/';
         const headers: Record<string, string | number | string[] | undefined> =
           {
             ...(req.headers as Record<string, string>),
@@ -79,6 +86,14 @@ export function startCredentialProxy(
           }
         }
 
+        const langSmithRun = startProxyLlmRun({
+          method: req.method || 'GET',
+          pathname,
+          upstreamBaseUrl: upstreamUrl.toString(),
+          contentType: req.headers['content-type'],
+          body,
+        });
+
         const upstream = makeRequest(
           {
             hostname: upstreamUrl.hostname,
@@ -88,12 +103,58 @@ export function startCredentialProxy(
             headers,
           } as RequestOptions,
           (upRes) => {
+            const responseChunks: Buffer[] = [];
+            let responseSize = 0;
+            let responseTruncated = false;
+
             res.writeHead(upRes.statusCode!, upRes.headers);
-            upRes.pipe(res);
+            upRes.on('data', (chunk: Buffer) => {
+              res.write(chunk);
+              if (responseTruncated) return;
+              responseSize += chunk.length;
+              if (responseSize > 262144) {
+                responseTruncated = true;
+                return;
+              }
+              responseChunks.push(chunk);
+            });
+            upRes.on('end', () => {
+              span.setAttribute('http.response.status_code', upRes.statusCode || 0);
+              res.end();
+              span.end();
+              void langSmithRun.then((run) =>
+                finishProxyLlmRun(run, {
+                  statusCode: upRes.statusCode,
+                  responseBody: Buffer.concat(responseChunks),
+                  responseContentType:
+                    typeof upRes.headers['content-type'] === 'string'
+                      ? upRes.headers['content-type']
+                      : undefined,
+                  ...(responseTruncated ? { error: 'response_body_truncated' } : {}),
+                }),
+              );
+            });
+            upRes.on('error', (err) => {
+              setSpanError(span, err);
+              span.end();
+              logger.error({ err, url: req.url }, 'Credential proxy response error');
+              if (!res.headersSent) {
+                res.writeHead(502);
+              }
+              res.end('Bad Gateway');
+              void langSmithRun.then((run) =>
+                finishProxyLlmRun(run, {
+                  responseBody: Buffer.concat(responseChunks),
+                  error: err instanceof Error ? err.message : String(err),
+                }),
+              );
+            });
           },
         );
 
         upstream.on('error', (err) => {
+          setSpanError(span, err);
+          span.end();
           logger.error(
             { err, url: req.url },
             'Credential proxy upstream error',
@@ -102,10 +163,20 @@ export function startCredentialProxy(
             res.writeHead(502);
             res.end('Bad Gateway');
           }
+          void langSmithRun.then((run) =>
+            finishProxyLlmRun(run, {
+              responseBody: Buffer.alloc(0),
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          );
         });
 
         upstream.write(body);
         upstream.end();
+      });
+      req.on('error', (err) => {
+        setSpanError(span, err);
+        span.end();
       });
     });
 

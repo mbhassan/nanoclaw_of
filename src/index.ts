@@ -60,6 +60,7 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { shutdownTelemetry, withSpan } from './telemetry.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -149,120 +150,115 @@ export function _setRegisteredGroups(
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
-  if (!group) return true;
+  return withSpan(
+    'nanoclaw.process_group_messages',
+    { 'nanoclaw.chat_jid': chatJid },
+    async () => {
+      const group = registeredGroups[chatJid];
+      if (!group) return true;
 
-  const channel = findChannel(channels, chatJid);
-  if (!channel) {
-    logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
-    return true;
-  }
-
-  const isMainGroup = group.isMain === true;
-
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(
-    chatJid,
-    sinceTimestamp,
-    ASSISTANT_NAME,
-  );
-
-  if (missedMessages.length === 0) return true;
-
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
-    const allowlistCfg = loadSenderAllowlist();
-    const hasTrigger = missedMessages.some(
-      (m) =>
-        TRIGGER_PATTERN.test(m.content.trim()) &&
-        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-    );
-    if (!hasTrigger) return true;
-  }
-
-  const prompt = formatMessages(missedMessages, TIMEZONE);
-
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
-  saveState();
-
-  logger.info(
-    { group: group.name, messageCount: missedMessages.length },
-    'Processing messages',
-  );
-
-  // Track idle timer for closing stdin when agent is idle
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const resetIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      logger.debug(
-        { group: group.name },
-        'Idle timeout, closing container stdin',
-      );
-      queue.closeStdin(chatJid);
-    }, IDLE_TIMEOUT);
-  };
-
-  await channel.setTyping?.(chatJid, true);
-  let hadError = false;
-  let outputSentToUser = false;
-
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+      const channel = findChannel(channels, chatJid);
+      if (!channel) {
+        logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+        return true;
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      const isMainGroup = group.isMain === true;
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
-
-  await channel.setTyping?.(chatJid, false);
-  if (idleTimer) clearTimeout(idleTimer);
-
-  if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
-    if (outputSentToUser) {
-      logger.warn(
-        { group: group.name },
-        'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+      const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+      const missedMessages = getMessagesSince(
+        chatJid,
+        sinceTimestamp,
+        ASSISTANT_NAME,
       );
-      return true;
-    }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
-    logger.warn(
-      { group: group.name },
-      'Agent error, rolled back message cursor for retry',
-    );
-    return false;
-  }
 
-  return true;
+      if (missedMessages.length === 0) return true;
+
+      if (!isMainGroup && group.requiresTrigger !== false) {
+        const allowlistCfg = loadSenderAllowlist();
+        const hasTrigger = missedMessages.some(
+          (m) =>
+            TRIGGER_PATTERN.test(m.content.trim()) &&
+            (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+        );
+        if (!hasTrigger) return true;
+      }
+
+      const prompt = formatMessages(missedMessages, TIMEZONE);
+      const previousCursor = lastAgentTimestamp[chatJid] || '';
+      lastAgentTimestamp[chatJid] =
+        missedMessages[missedMessages.length - 1].timestamp;
+      saveState();
+
+      logger.info(
+        { group: group.name, messageCount: missedMessages.length },
+        'Processing messages',
+      );
+
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const resetIdleTimer = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          logger.debug(
+            { group: group.name },
+            'Idle timeout, closing container stdin',
+          );
+          queue.closeStdin(chatJid);
+        }, IDLE_TIMEOUT);
+      };
+
+      await channel.setTyping?.(chatJid, true);
+      let hadError = false;
+      let outputSentToUser = false;
+
+      const output = await runAgent(group, prompt, chatJid, async (result) => {
+        if (result.result) {
+          const raw =
+            typeof result.result === 'string'
+              ? result.result
+              : JSON.stringify(result.result);
+          const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+          logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
+          if (text) {
+            await channel.sendMessage(chatJid, text);
+            outputSentToUser = true;
+          }
+          resetIdleTimer();
+        }
+
+        if (result.status === 'success') {
+          queue.notifyIdle(chatJid);
+        }
+
+        if (result.status === 'error') {
+          hadError = true;
+        }
+      });
+
+      await channel.setTyping?.(chatJid, false);
+      if (idleTimer) clearTimeout(idleTimer);
+
+      if (output === 'error' || hadError) {
+        if (outputSentToUser) {
+          logger.warn(
+            { group: group.name },
+            'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+          );
+          return true;
+        }
+        lastAgentTimestamp[chatJid] = previousCursor;
+        saveState();
+        logger.warn(
+          { group: group.name },
+          'Agent error, rolled back message cursor for retry',
+        );
+        return false;
+      }
+
+      return true;
+    },
+  );
 }
 
 async function runAgent(
@@ -271,79 +267,86 @@ async function runAgent(
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
-  const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  return withSpan(
+    'nanoclaw.run_agent',
+    {
+      'nanoclaw.group': group.folder,
+      'nanoclaw.chat_jid': chatJid,
+      'nanoclaw.is_main': group.isMain === true,
+    },
+    async () => {
+      const isMain = group.isMain === true;
+      const sessionId = sessions[group.folder];
 
-  // Update tasks snapshot for container to read (filtered by group)
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
+      const tasks = getAllTasks();
+      writeTasksSnapshot(
+        group.folder,
+        isMain,
+        tasks.map((t) => ({
+          id: t.id,
+          groupFolder: t.group_folder,
+          prompt: t.prompt,
+          schedule_type: t.schedule_type,
+          schedule_value: t.schedule_value,
+          status: t.status,
+          next_run: t.next_run,
+        })),
+      );
 
-  // Update available groups snapshot (main group only can see all groups)
-  const availableGroups = getAvailableGroups();
-  writeGroupsSnapshot(
-    group.folder,
-    isMain,
-    availableGroups,
-    new Set(Object.keys(registeredGroups)),
-  );
+      const availableGroups = getAvailableGroups();
+      writeGroupsSnapshot(
+        group.folder,
+        isMain,
+        availableGroups,
+        new Set(Object.keys(registeredGroups)),
+      );
 
-  // Wrap onOutput to track session ID from streamed results
-  const wrappedOnOutput = onOutput
-    ? async (output: ContainerOutput) => {
+      const wrappedOnOutput = onOutput
+        ? async (output: ContainerOutput) => {
+            if (output.newSessionId) {
+              sessions[group.folder] = output.newSessionId;
+              setSession(group.folder, output.newSessionId);
+            }
+            await onOutput(output);
+          }
+        : undefined;
+
+      try {
+        const output = await runContainerAgent(
+          group,
+          {
+            prompt,
+            sessionId,
+            groupFolder: group.folder,
+            chatJid,
+            isMain,
+            assistantName: ASSISTANT_NAME,
+          },
+          (proc, containerName) =>
+            queue.registerProcess(chatJid, proc, containerName, group.folder),
+          wrappedOnOutput,
+        );
+
         if (output.newSessionId) {
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId);
         }
-        await onOutput(output);
+
+        if (output.status === 'error') {
+          logger.error(
+            { group: group.name, error: output.error },
+            'Container agent error',
+          );
+          return 'error';
+        }
+
+        return 'success';
+      } catch (err) {
+        logger.error({ group: group.name, err }, 'Agent error');
+        return 'error';
       }
-    : undefined;
-
-  try {
-    const output = await runContainerAgent(
-      group,
-      {
-        prompt,
-        sessionId,
-        groupFolder: group.folder,
-        chatJid,
-        isMain,
-        assistantName: ASSISTANT_NAME,
-      },
-      (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
-      wrappedOnOutput,
-    );
-
-    if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
-    }
-
-    if (output.status === 'error') {
-      logger.error(
-        { group: group.name, error: output.error },
-        'Container agent error',
-      );
-      return 'error';
-    }
-
-    return 'success';
-  } catch (err) {
-    logger.error({ group: group.name, err }, 'Agent error');
-    return 'error';
-  }
+    },
+  );
 }
 
 async function startMessageLoop(): Promise<void> {
@@ -489,6 +492,7 @@ async function main(): Promise<void> {
     proxyServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
+    await shutdownTelemetry();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -593,8 +597,11 @@ async function main(): Promise<void> {
     await channel.connect();
   }
   if (channels.length === 0) {
-    logger.fatal('No channels connected');
-    process.exit(1);
+    logger.warn(
+      'No channels connected; NanoClaw is running in setup-only mode until a channel is installed and configured',
+    );
+    await new Promise<void>(() => {});
+    return;
   }
 
   // Start subsystems (independently of connection handler)

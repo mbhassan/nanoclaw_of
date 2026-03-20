@@ -1,0 +1,56 @@
+services:
+  nanoclaw:
+    build:
+      context: .
+      dockerfile: compose/nanoclaw.Dockerfile
+    image: nanoclaw-compose:latest
+    working_dir: ${NANOCLAW_PROJECT_ROOT:?set NANOCLAW_PROJECT_ROOT in your .env}
+    environment:
+      NANOCLAW_PROJECT_ROOT: ${NANOCLAW_PROJECT_ROOT:?set NANOCLAW_PROJECT_ROOT in your .env}
+      CONTAINER_IMAGE: nanoclaw-agent:latest
+      CREDENTIAL_PROXY_HOST: 0.0.0.0
+      OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://host.docker.internal:4318}
+      DEPLOYMENT_ENVIRONMENT: ${DEPLOYMENT_ENVIRONMENT:-docker-compose}
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-nanoclaw}
+      LANGSMITH_ENDPOINT: ${LANGSMITH_ENDPOINT:-}
+      LANGSMITH_WORKSPACE_ID: ${LANGSMITH_WORKSPACE_ID:-}
+      LANGSMITH_MAX_BODY_BYTES: ${LANGSMITH_MAX_BODY_BYTES:-262144}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ${NANOCLAW_PROJECT_ROOT:?set NANOCLAW_PROJECT_ROOT in your .env}:${NANOCLAW_PROJECT_ROOT:?set NANOCLAW_PROJECT_ROOT in your .env}
+      - nanoclaw_node_modules:${NANOCLAW_PROJECT_ROOT:?set NANOCLAW_PROJECT_ROOT in your .env}/node_modules
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "3001:3001"
+    depends_on:
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.121.0
+    command:
+      - "--config=/etc/otelcol-contrib/config.yaml"
+    volumes:
+      - ./otel/collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./otel/out:/var/lib/otel-collector
+    ports:
+      - "4318:4318"
+    restart: unless-stopped
+    depends_on:
+      jaeger:
+        condition: service_started
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.65.0
+    ports:
+      - "16686:16686"
+    restart: unless-stopped
+
+volumes:
+  nanoclaw_node_modules:

@@ -18,6 +18,7 @@ vi.mock('child_process', () => ({
 
 import {
   CONTAINER_RUNTIME_BIN,
+  NANOCLAW_AGENT_CONTAINER_LABEL,
   readonlyMountArgs,
   stopContainer,
   ensureContainerRuntimeRunning,
@@ -92,6 +93,11 @@ describe('cleanupOrphans', () => {
     // ps + 2 stop calls
     expect(mockExecSync).toHaveBeenCalledTimes(3);
     expect(mockExecSync).toHaveBeenNthCalledWith(
+      1,
+      `${CONTAINER_RUNTIME_BIN} ps --filter label=${NANOCLAW_AGENT_CONTAINER_LABEL} --format '{{.Names}}'`,
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+    );
+    expect(mockExecSync).toHaveBeenNthCalledWith(
       2,
       `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-group1-111`,
       { stdio: 'pipe' },
@@ -113,6 +119,10 @@ describe('cleanupOrphans', () => {
     cleanupOrphans();
 
     expect(mockExecSync).toHaveBeenCalledTimes(1);
+    expect(mockExecSync).toHaveBeenCalledWith(
+      `${CONTAINER_RUNTIME_BIN} ps --filter label=${NANOCLAW_AGENT_CONTAINER_LABEL} --format '{{.Names}}'`,
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+    );
     expect(logger.info).not.toHaveBeenCalled();
   });
 

@@ -18,6 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { emitTelemetryLog, shutdownTelemetry, withSpan } from './telemetry.js';
 
 interface ContainerInput {
   prompt: string;
@@ -115,6 +116,7 @@ function writeOutput(output: ContainerOutput): void {
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
+  emitTelemetryLog('info', message);
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
@@ -337,34 +339,43 @@ async function runQuery(
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
-  const stream = new MessageStream();
-  stream.push(prompt);
+  return withSpan(
+    'nanoclaw.agent_runner.query',
+    {
+      'nanoclaw.group': containerInput.groupFolder,
+      'nanoclaw.chat_jid': containerInput.chatJid,
+      'nanoclaw.is_main': containerInput.isMain,
+      'nanoclaw.prompt_length': prompt.length,
+      ...(sessionId ? { 'nanoclaw.session_id_present': true } : {}),
+    },
+    async () => {
+      const stream = new MessageStream();
+      stream.push(prompt);
 
-  // Poll IPC for follow-up messages and _close sentinel during the query
-  let ipcPolling = true;
-  let closedDuringQuery = false;
-  const pollIpcDuringQuery = () => {
-    if (!ipcPolling) return;
-    if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
-      closedDuringQuery = true;
-      stream.end();
-      ipcPolling = false;
-      return;
-    }
-    const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
-    }
-    setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-  };
-  setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
+      let ipcPolling = true;
+      let closedDuringQuery = false;
+      const pollIpcDuringQuery = () => {
+        if (!ipcPolling) return;
+        if (shouldClose()) {
+          log('Close sentinel detected during query, ending stream');
+          closedDuringQuery = true;
+          stream.end();
+          ipcPolling = false;
+          return;
+        }
+        const messages = drainIpcInput();
+        for (const text of messages) {
+          log(`Piping IPC message into active query (${text.length} chars)`);
+          stream.push(text);
+        }
+        setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
+      };
+      setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
 
-  let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
-  let messageCount = 0;
-  let resultCount = 0;
+      let newSessionId: string | undefined;
+      let lastAssistantUuid: string | undefined;
+      let messageCount = 0;
+      let resultCount = 0;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -389,7 +400,7 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
-  for await (const message of query({
+      for await (const message of query({
     prompt: stream,
     options: {
       cwd: '/workspace/group',
@@ -428,7 +439,7 @@ async function runQuery(
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },
     }
-  })) {
+      })) {
     messageCount++;
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
@@ -457,29 +468,33 @@ async function runQuery(
         newSessionId
       });
     }
-  }
+      }
 
-  ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+      ipcPolling = false;
+      log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
+      return { newSessionId, lastAssistantUuid, closedDuringQuery };
+    },
+  );
 }
 
 async function main(): Promise<void> {
-  let containerInput: ContainerInput;
+  await withSpan('nanoclaw.agent_runner.main', undefined, async () => {
+    let containerInput: ContainerInput;
 
-  try {
-    const stdinData = await readStdin();
-    containerInput = JSON.parse(stdinData);
-    try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
-    log(`Received input for group: ${containerInput.groupFolder}`);
-  } catch (err) {
-    writeOutput({
-      status: 'error',
-      result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
-    });
-    process.exit(1);
-  }
+    try {
+      const stdinData = await readStdin();
+      containerInput = JSON.parse(stdinData);
+      try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
+      log(`Received input for group: ${containerInput.groupFolder}`);
+    } catch (err) {
+      writeOutput({
+        status: 'error',
+        result: null,
+        error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
+      });
+      process.exit(1);
+      return;
+    }
 
   // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
   // No real secrets exist in the container environment.
@@ -507,52 +522,50 @@ async function main(): Promise<void> {
 
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
-  try {
-    while (true) {
-      log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
+    try {
+      while (true) {
+        log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
-      if (queryResult.newSessionId) {
-        sessionId = queryResult.newSessionId;
+        const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+        if (queryResult.newSessionId) {
+          sessionId = queryResult.newSessionId;
+        }
+        if (queryResult.lastAssistantUuid) {
+          resumeAt = queryResult.lastAssistantUuid;
+        }
+
+        if (queryResult.closedDuringQuery) {
+          log('Close sentinel consumed during query, exiting');
+          break;
+        }
+
+        writeOutput({ status: 'success', result: null, newSessionId: sessionId });
+
+        log('Query ended, waiting for next IPC message...');
+
+        const nextMessage = await waitForIpcMessage();
+        if (nextMessage === null) {
+          log('Close sentinel received, exiting');
+          break;
+        }
+
+        log(`Got new message (${nextMessage.length} chars), starting new query`);
+        prompt = nextMessage;
       }
-      if (queryResult.lastAssistantUuid) {
-        resumeAt = queryResult.lastAssistantUuid;
-      }
-
-      // If _close was consumed during the query, exit immediately.
-      // Don't emit a session-update marker (it would reset the host's
-      // idle timer and cause a 30-min delay before the next _close).
-      if (queryResult.closedDuringQuery) {
-        log('Close sentinel consumed during query, exiting');
-        break;
-      }
-
-      // Emit session update so host can track it
-      writeOutput({ status: 'success', result: null, newSessionId: sessionId });
-
-      log('Query ended, waiting for next IPC message...');
-
-      // Wait for the next message or _close sentinel
-      const nextMessage = await waitForIpcMessage();
-      if (nextMessage === null) {
-        log('Close sentinel received, exiting');
-        break;
-      }
-
-      log(`Got new message (${nextMessage.length} chars), starting new query`);
-      prompt = nextMessage;
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log(`Agent error: ${errorMessage}`);
+      writeOutput({
+        status: 'error',
+        result: null,
+        newSessionId: sessionId,
+        error: errorMessage
+      });
+      process.exit(1);
+    } finally {
+      await shutdownTelemetry();
     }
-  } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    log(`Agent error: ${errorMessage}`);
-    writeOutput({
-      status: 'error',
-      result: null,
-      newSessionId: sessionId,
-      error: errorMessage
-    });
-    process.exit(1);
-  }
+  });
 }
 
 main();

@@ -203,6 +203,58 @@ This allows you to use:
 
 Note: The model must support the Anthropic API format for best compatibility.
 
+**Can I add telemetry?**
+
+Yes. NanoClaw now supports two telemetry paths:
+
+- **OpenTelemetry** for application traces and logs from both the host orchestrator and the container-side agent runner
+- **LangSmith** for logging proxied Anthropic-compatible LLM calls at the credential proxy layer
+
+Set these in `.env`:
+
+```bash
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=your-langsmith-key
+LANGSMITH_PROJECT=nanoclaw
+```
+
+Notes:
+- The host process reads these values from `.env` directly.
+- The agent runner receives the `OTEL_*` settings when containers start.
+- LangSmith logging happens in the credential proxy, so it captures real model requests that flow through NanoClaw's Anthropic-compatible endpoint path.
+
+**Can I run NanoClaw with Docker Compose?**
+
+Yes. A local stack is included in [docker-compose.yml](/Users/mohibhassan/Desktop/Openfarming/Technology/nanoclaw_of/docker-compose.yml). It runs:
+
+- `nanoclaw` - the main orchestrator process
+- `otel-collector` - OTLP receiver/export pipeline
+- `jaeger` - local trace UI at `http://localhost:16686`
+
+The collector writes logs to `otel/out/nanoclaw-logs.jsonl` and forwards traces to Jaeger.
+
+Before starting, set this in `.env`:
+
+```bash
+NANOCLAW_PROJECT_ROOT=/absolute/path/to/your/nanoclaw/repo
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4318
+```
+
+Then start the stack:
+
+```bash
+docker compose up --build
+```
+
+Important:
+- `NANOCLAW_PROJECT_ROOT` must be the repo's real absolute path on the Docker host.
+- This is required because NanoClaw spawns agent containers through the host Docker daemon and bind-mounts paths from that host filesystem.
+- The NanoClaw credential proxy is published on host port `3001` so spawned agent containers can still reach it via `host.docker.internal`.
+
 **How do I debug issues?**
 
 Ask Claude Code. "Why isn't the scheduler running?" "What's in the recent logs?" "Why did this message not get a response?" That's the AI-native approach that underlies NanoClaw.

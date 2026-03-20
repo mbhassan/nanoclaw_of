@@ -20,13 +20,16 @@ import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
   CONTAINER_HOST_GATEWAY,
+  NANOCLAW_AGENT_CONTAINER_LABEL,
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
+import { withSpan } from './telemetry.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -217,6 +220,7 @@ function buildContainerArgs(
   containerName: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+  args.push('--label', NANOCLAW_AGENT_CONTAINER_LABEL);
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -237,6 +241,32 @@ function buildContainerArgs(
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
   }
+
+  const telemetryEnv = readEnvFile([
+    'OTEL_ENABLED',
+    'OTEL_EXPORTER_OTLP_ENDPOINT',
+    'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT',
+    'OTEL_EXPORTER_OTLP_LOGS_ENDPOINT',
+    'OTEL_EXPORTER_OTLP_HEADERS',
+    'OTEL_EXPORTER_OTLP_TRACES_HEADERS',
+    'OTEL_EXPORTER_OTLP_LOGS_HEADERS',
+    'DEPLOYMENT_ENVIRONMENT',
+  ]);
+  const passthroughKeys = [
+    'OTEL_ENABLED',
+    'OTEL_EXPORTER_OTLP_ENDPOINT',
+    'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT',
+    'OTEL_EXPORTER_OTLP_LOGS_ENDPOINT',
+    'OTEL_EXPORTER_OTLP_HEADERS',
+    'OTEL_EXPORTER_OTLP_TRACES_HEADERS',
+    'OTEL_EXPORTER_OTLP_LOGS_HEADERS',
+    'DEPLOYMENT_ENVIRONMENT',
+  ] as const;
+  for (const key of passthroughKeys) {
+    const value = process.env[key] || telemetryEnv[key];
+    if (value) args.push('-e', `${key}=${value}`);
+  }
+  args.push('-e', 'OTEL_SERVICE_NAME=nanoclaw-agent-runner');
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
@@ -270,63 +300,72 @@ export async function runContainerAgent(
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
-  const startTime = Date.now();
-
-  const groupDir = resolveGroupFolderPath(group.folder);
-  fs.mkdirSync(groupDir, { recursive: true });
-
-  const mounts = buildVolumeMounts(group, input.isMain);
-  const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-  const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
-
-  logger.debug(
+  return withSpan(
+    'nanoclaw.run_container_agent',
     {
-      group: group.name,
-      containerName,
-      mounts: mounts.map(
-        (m) =>
-          `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
-      ),
-      containerArgs: containerArgs.join(' '),
+      'nanoclaw.group': group.folder,
+      'nanoclaw.chat_jid': input.chatJid,
+      'nanoclaw.is_main': input.isMain,
+      'nanoclaw.is_scheduled_task': input.isScheduledTask === true,
     },
-    'Container mount configuration',
-  );
+    async () => {
+      const startTime = Date.now();
 
-  logger.info(
-    {
-      group: group.name,
-      containerName,
-      mountCount: mounts.length,
-      isMain: input.isMain,
-    },
-    'Spawning container agent',
-  );
+      const groupDir = resolveGroupFolderPath(group.folder);
+      fs.mkdirSync(groupDir, { recursive: true });
 
-  const logsDir = path.join(groupDir, 'logs');
-  fs.mkdirSync(logsDir, { recursive: true });
+      const mounts = buildVolumeMounts(group, input.isMain);
+      const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
+      const containerName = `nanoclaw-${safeName}-${Date.now()}`;
+      const containerArgs = buildContainerArgs(mounts, containerName);
 
-  return new Promise((resolve) => {
-    const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+      logger.debug(
+        {
+          group: group.name,
+          containerName,
+          mounts: mounts.map(
+            (m) =>
+              `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
+          ),
+          containerArgs: containerArgs.join(' '),
+        },
+        'Container mount configuration',
+      );
 
-    onProcess(container, containerName);
+      logger.info(
+        {
+          group: group.name,
+          containerName,
+          mountCount: mounts.length,
+          isMain: input.isMain,
+        },
+        'Spawning container agent',
+      );
+
+      const logsDir = path.join(groupDir, 'logs');
+      fs.mkdirSync(logsDir, { recursive: true });
+
+      return new Promise((resolve) => {
+        const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        onProcess(container, containerName);
 
     let stdout = '';
     let stderr = '';
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    container.stdin.write(JSON.stringify(input));
-    container.stdin.end();
+        container.stdin.write(JSON.stringify(input));
+        container.stdin.end();
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
 
-    container.stdout.on('data', (data) => {
+        container.stdout.on('data', (data) => {
       const chunk = data.toString();
 
       // Always accumulate for logging
@@ -376,9 +415,9 @@ export async function runContainerAgent(
           }
         }
       }
-    });
+        });
 
-    container.stderr.on('data', (data) => {
+        container.stderr.on('data', (data) => {
       const chunk = data.toString();
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
@@ -398,16 +437,14 @@ export async function runContainerAgent(
       } else {
         stderr += chunk;
       }
-    });
+        });
 
-    let timedOut = false;
-    let hadStreamingOutput = false;
-    const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
-    // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
-    // graceful _close sentinel has time to trigger before the hard kill fires.
-    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
+        let timedOut = false;
+        let hadStreamingOutput = false;
+        const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+        const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
 
-    const killOnTimeout = () => {
+        const killOnTimeout = () => {
       timedOut = true;
       logger.error(
         { group: group.name, containerName },
@@ -422,17 +459,17 @@ export async function runContainerAgent(
           container.kill('SIGKILL');
         }
       });
-    };
+        };
 
-    let timeout = setTimeout(killOnTimeout, timeoutMs);
+        let timeout = setTimeout(killOnTimeout, timeoutMs);
 
     // Reset the timeout whenever there's activity (streaming output)
-    const resetTimeout = () => {
+        const resetTimeout = () => {
       clearTimeout(timeout);
       timeout = setTimeout(killOnTimeout, timeoutMs);
-    };
+        };
 
-    container.on('close', (code) => {
+        container.on('close', (code) => {
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
 
@@ -652,8 +689,10 @@ export async function runContainerAgent(
         result: null,
         error: `Container spawn error: ${err.message}`,
       });
-    });
-  });
+        });
+      });
+    },
+  );
 }
 
 export function writeTasksSnapshot(
